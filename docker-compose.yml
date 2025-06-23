@@ -53,19 +53,19 @@ services:
   serve-app:
     build: .
     container_name: serve-app
-    command: |  # <--- USA ESTE ESTILO PARA MULTILÍNEA
+    command: |
       bash -c "
         echo 'Esperando a que el clúster Ray esté listo...' &&
         sleep 10 &&
         echo 'Iniciando Ray Serve application (serve_ray.py)...' &&
-        serve run serve_ray:deployment_graph --host=0.0.0.0 --port=8000 &&
-        echo 'Ray Serve API en marcha en el puerto 8000 (interno)' &&
+        serve run serve_ray:deployment_graph && # <--- MODIFICADO: Sin --host y --port
+        echo 'Comando serve run finalizado (si esto aparece rápido, podría ser un problema, o éxito si se queda corriendo y sirve)' &&
         tail -f /dev/null
       "
     depends_on:
-      - ray-head # Esto está bien indentado
+      - ray-head
     ports:
-      - "8001:8000"
+      - "8001:8000" # Esto es correcto, Ray Serve usará el puerto 8000 internamente por defecto
     networks:
       - ray-net
     shm_size: 1gb
