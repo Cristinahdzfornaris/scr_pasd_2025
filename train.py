@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 import time
 import json # Para guardar métricas y mejores HPs
-
+import traceback
 import pandas as pd
 import numpy as np # Para matriz de confusión
 import matplotlib.pyplot as plt
@@ -117,6 +117,9 @@ def train_model_with_hyperparam_tuning(
         
         print(f"{log_prefix} - PUNTO DE CONTROL: Iniciando GridSearchCV.fit() para {model_type} en {dataset_id}...")
         start_fit_time = time.time()
+        if "iris" in dataset_id and "random_forest" in model_type:
+            print(f"{log_prefix} - SIMULANDO TAREA LARGA: Pausando por 15 segundos...")
+            time.sleep(15)
         grid_search = GridSearchCV(estimator=full_pipeline, param_grid=current_param_grid, cv=cv_folds, scoring='accuracy', n_jobs=1)
         grid_search.fit(X_train, y_train)
         fit_duration = time.time() - start_fit_time
@@ -241,15 +244,33 @@ def generar_graficas_entrenamiento(training_results_list, base_dir):
 
 
 # --- Flujo Principal de Entrenamiento ---
+# train.py
+
+# ... (todo tu código anterior: imports, funciones auxiliares, etc.)
+
+# --- Flujo Principal de Entrenamiento ---
 if __name__ == "__main__":
     print("Iniciando script de entrenamiento distribuido con optimización de hiperparámetros...")
     
     try:
+        # --- SECCIÓN MODIFICADA ---
+        # Lee la dirección de Ray desde la variable de entorno configurada en docker-compose.yml
+        # Si no la encuentra, usa 'auto' como fallback para ejecución local.
+        # El valor "ray://ray-head:10001" será inyectado por Docker Compose.
+        ray_address = os.environ.get("RAY_ADDRESS", "auto")
+        print(f"Intentando conectar a Ray en la dirección: {ray_address}")
+
         if not ray.is_initialized():
-            ray.init(address='auto', ignore_reinit_error=True) 
-        print(f"Conectado a Ray. Nodos del clúster: {ray.nodes()}")
+            # Usamos la dirección que obtuvimos
+            ray.init(address=ray_address, ignore_reinit_error=True)
+
+        print(f"Conexión a Ray exitosa. Nodos del clúster: {ray.nodes()}")
+        # --- FIN DE LA SECCIÓN MODIFICADA ---
+
     except Exception as e:
-        print(f"Error crítico al inicializar o conectar con Ray: {e}"); exit(1)
+        print(f"Error crítico al inicializar o conectar con Ray: {e}")
+        traceback.print_exc() # Imprime el traceback completo para más detalles
+        exit(1)
     
     os.makedirs(BASE_MODEL_DIR, exist_ok=True)
     datasets_to_process = ["iris", "wine", "breast_cancer"]
@@ -264,9 +285,11 @@ if __name__ == "__main__":
         print(f"\n--- Procesando dataset: {dataset_name} ---")
         data_df, target_col, dataset_id_str, feature_names_list, class_names_list = get_dataset(dataset_name)
         if data_df is None: continue
+
+        # Colocar los datos en el object store de Ray para que los workers puedan acceder a ellos
         data_df_ref = ray.put(data_df)
         feature_names_ref = ray.put(feature_names_list)
-        class_names_ref = ray.put(class_names_list) # Poner nombres de clases en object store
+        class_names_ref = ray.put(class_names_list)
 
         print(f"Lanzando entrenamientos con HP Tuning para el dataset: {dataset_name}")
         for model_config_entry in model_configurations:
@@ -276,7 +299,7 @@ if __name__ == "__main__":
                 model_config_entry['param_grid'], dataset_id_str,
                 feature_names_ref, # Pasar referencia
                 class_names_ref,   # Pasar referencia
-                cv_folds=3 # Reducido para rapidez general
+                cv_folds=3 
             )
             all_training_task_refs.append(task_ref)
 
@@ -284,31 +307,33 @@ if __name__ == "__main__":
     try:
         training_results = ray.get(all_training_task_refs)
     except ray.exceptions.RayTaskError as e:
-        print(f"ERROR FATAL: Tarea Ray falló: {e.cause}"); exit(1)
+        print(f"ERROR FATAL: Tarea Ray falló: {e.cause}"); 
+        exit(1)
     except Exception as e:
-        print(f"ERROR inesperado en ray.get(): {e}"); traceback.print_exc(); exit(1)
+        print(f"ERROR inesperado en ray.get(): {e}"); 
+        traceback.print_exc(); 
+        exit(1)
 
     print("\n--- Resumen Final del Entrenamiento (con HP Tuning) ---")
     successful_trainings = 0
-    parsed_results_for_graphing = [] # Lista para pasar a la función de graficar
+    parsed_results_for_graphing = []
 
     for result in training_results:
         if result and result[0] is not None:
             pipeline_path, metrics_dict, model_t, ds_id, fn_path, best_hp, exec_host, exec_worker = result
-            parsed_results_for_graphing.append(result) # Guardar el resultado completo
+            parsed_results_for_graphing.append(result)
             print(f"  Dataset: {ds_id:<15} | Modelo: {model_t:<20} | Precisión (Test): {metrics_dict['accuracy']:.4f} | Host: {exec_host} ({exec_worker})")
             print(f"    Mejores HP: {best_hp}")
             print(f"    Pipeline: {pipeline_path}")
-            # Imprimir más métricas del classification_report
+            
             if 'classification_report' in metrics_dict and metrics_dict['classification_report']:
                 for class_label, report_metrics in metrics_dict['classification_report'].items():
-                    if isinstance(report_metrics, dict): # Para cada clase y promedios
+                    if isinstance(report_metrics, dict):
                         print(f"      {class_label:<25} - Precision: {report_metrics.get('precision', 0):.2f}, Recall: {report_metrics.get('recall', 0):.2f}, F1: {report_metrics.get('f1-score', 0):.2f}")
             successful_trainings += 1
-        else: # Manejo de fallos
-            # ... (código de manejo de fallos como lo tenías)
+        else:
             if result: 
-                 _, _, model_t_fail, ds_id_fail, _, _, exec_host_f, exec_worker_f = result # Asumiendo misma estructura de retorno
+                 _, _, model_t_fail, ds_id_fail, _, _, exec_host_f, exec_worker_f = result
                  print(f"  FALLO - Dataset: {ds_id_fail:<15} | Modelo: {model_t_fail:<20} | Host: {exec_host_f} ({exec_worker_f})")
             else:
                  print(f"  FALLO - Un trabajo de entrenamiento no devolvió un resultado válido (probablemente None).")
@@ -320,4 +345,7 @@ if __name__ == "__main__":
 
     if successful_trainings < len(all_training_task_refs):
         print("ADVERTENCIA: No todos los entrenamientos fueron exitosos.")
-    print("Script de entrenamiento finalizado.")
+        # Salimos con código 1 si algo falló, para que Docker Compose lo sepa.
+        exit(1)
+
+    print("Script de entrenamiento finalizado exitosamente.")

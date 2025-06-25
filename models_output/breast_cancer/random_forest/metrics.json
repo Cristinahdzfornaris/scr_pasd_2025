@@ -1,0 +1,45 @@
+{
+    "accuracy": 0.956140350877193,
+    "classification_report": {
+        "malignant": {
+            "precision": 0.9512195121951219,
+            "recall": 0.9285714285714286,
+            "f1-score": 0.9397590361445783,
+            "support": 42.0
+        },
+        "benign": {
+            "precision": 0.958904109589041,
+            "recall": 0.9722222222222222,
+            "f1-score": 0.9655172413793104,
+            "support": 72.0
+        },
+        "accuracy": 0.956140350877193,
+        "macro avg": {
+            "precision": 0.9550618108920814,
+            "recall": 0.9503968253968254,
+            "f1-score": 0.9526381387619444,
+            "support": 114.0
+        },
+        "weighted avg": {
+            "precision": 0.9560729421281235,
+            "recall": 0.956140350877193,
+            "f1-score": 0.9560273762928302,
+            "support": 114.0
+        }
+    },
+    "confusion_matrix": [
+        [
+            39,
+            3
+        ],
+        [
+            2,
+            70
+        ]
+    ],
+    "best_hyperparameters": {
+        "classifier__max_depth": 5,
+        "classifier__n_estimators": 100
+    },
+    "training_duration_sec": 0.9391100406646729
+}

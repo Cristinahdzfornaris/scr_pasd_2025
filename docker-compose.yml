@@ -1,77 +1,63 @@
-version: '3.8' # Especifica una versión de Compose
+
 
 services:
   ray-head:
     build: .
-    container_name: ray-head
-    command: |
-     bash -c "ray start --head --port=6379 --dashboard-host=0.0.0.0 --include-dashboard=true --ray-client-server-port=10001 && echo 'Nodo HEAD en marcha. Dashboard: http://localhost:8265. Ray Client: localhost:10001' && tail -f /dev/null"
     ports:
-      - "6379:6379"
       - "8265:8265"
-      - "10001:10001" # Puerto para Ray Client
-    networks:
-      - ray-net
-    shm_size: 1gb # Ajusta según tu sistema y necesidades
-    # cpus: 2 # Opcional: Descomenta y ajusta si quieres limitar CPUs
+      - "10001:10001"
     volumes:
-      - .:/app # Monta el directorio actual del host en /app del contenedor
+      - model_storage:/app/models_output
+    # COMANDO MODIFICADO PARA MANTENER EL CONTENEDOR VIVO
+    command: sh -c "ray start --head --port=6379 --ray-client-server-port=10001 --dashboard-host=0.0.0.0 --disable-usage-stats && tail -f /dev/null"
 
-  ray-worker-1:
+  ray-worker:
     build: .
-    container_name: ray-worker-1
-    command: bash -c "
-      ray start --address=ray-head:6379 &&
-      echo 'Worker 1 conectado al HEAD' &&
-      tail -f /dev/null"
     depends_on:
       - ray-head
-    networks:
-      - ray-net
-    shm_size: 1gb
-    # cpus: 1 # Opcional
     volumes:
-      - .:/app
+      - model_storage:/app/models_output
+    deploy:
+      replicas: 2
+    # COMANDO MODIFICADO PARA MANTENER EL CONTENEDOR VIVO
+    command: sh -c "ray start --address=ray-head:6379 --disable-usage-stats && tail -f /dev/null"
 
-  ray-worker-2:
+  training-service:
     build: .
-    container_name: ray-worker-2
-    command: bash -c "
-      ray start --address=ray-head:6379 &&
-      echo 'Worker 2 conectado al HEAD' &&
-      tail -f /dev/null"
     depends_on:
       - ray-head
-    networks:
-      - ray-net
-    shm_size: 1gb
-    # cpus: 1 # Opcional
+      - ray-worker
     volumes:
-      - .:/app
+      - model_storage:/app/models_output
+    environment:
+      - RAY_ADDRESS=ray://ray-head:10001
+    # Usamos el sleep para dar tiempo al clúster a estabilizarse
+    command: sh -c "echo 'Esperando 10 segundos para que el clúster de Ray se estabilice...' && sleep 10 && python train.py"
 
-  # NUEVO SERVICIO PARA RAY SERVE
-  serve-app:
+  api-service:
     build: .
-    container_name: serve-app
-    command: |
-      bash -c "
-        echo 'Esperando a que el clúster Ray esté listo...' &&
-        sleep 10 &&
-        echo 'Iniciando Ray Serve application (serve_ray.py)...' &&
-        serve run serve_ray:deployment_graph && # <--- MODIFICADO: Sin --host y --port
-        echo 'Comando serve run finalizado (si esto aparece rápido, podría ser un problema, o éxito si se queda corriendo y sirve)' &&
-        tail -f /dev/null
-      "
     depends_on:
-      - ray-head
+      training-service:
+        condition: service_completed_successfully
+    volumes:
+      - model_storage:/app/models_output
     ports:
-      - "8001:8000" # Esto es correcto, Ray Serve usará el puerto 8000 internamente por defecto
-    networks:
-      - ray-net
-    shm_size: 1gb
-    volumes:
-      - .:/app # Para que pueda acceder a serve_ray.py y a los modelos guardados
+      - "8000:8000"
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 
-networks:
-  ray-net:
-    driver: bridge # Define el tipo de red (bridge es el por defecto y está bien aquí)
+  gui-service:
+    build: .
+    depends_on:
+      # Forma larga para ambas dependencias
+      ray-head:
+        condition: service_started
+      training-service:
+        condition: service_completed_successfully
+    volumes:
+      - model_storage:/app/models_output
+    ports:
+      - "8501:8501"
+    command: streamlit run gui.py --server.port=8501 --server.address=0.0.0.0
+
+volumes:
+  model_storage:
