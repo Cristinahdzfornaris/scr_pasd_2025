@@ -3,6 +3,7 @@ import streamlit as st
 import requests
 import os
 import pandas as pd
+import json
 
 # URLs de las APIs (leídas de variables de entorno puestas por docker-compose)
 MANAGEMENT_API_URL = os.environ.get("MANAGEMENT_API_URL", "http://localhost:9000")
