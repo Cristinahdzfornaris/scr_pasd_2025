@@ -3,148 +3,99 @@ import streamlit as st
 import requests
 import os
 import pandas as pd
-import ray  # Importante para conectar con el clúster
 
-# --- Configuración ---
-API_URL = "http://api-service:8000"  # Usamos el nombre del servicio de Docker Compose
-GRAPHS_DIR = "/app/models_output/training_graphs"
-RAY_ADDRESS = "ray://ray-head:10001" # Dirección del clúster de Ray para obtener el estado
+# URLs de las APIs (leídas de variables de entorno puestas por docker-compose)
+MANAGEMENT_API_URL = os.environ.get("MANAGEMENT_API_URL", "http://localhost:9000")
+INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "http://localhost:8000")
 
 st.set_page_config(layout="wide")
 st.title("📊 Plataforma de Aprendizaje Supervisado Distribuido")
 
-# --- Funciones de Interacción con la API y Ray ---
-
-@st.cache_data(ttl=60) # Cachear por 60 segundos
+# --- Funciones de Ayuda ---
+@st.cache_data(ttl=30)
 def get_available_models():
-    """Obtiene la lista de modelos desde la API."""
     try:
-        response = requests.get(f"{API_URL}/models")
+        response = requests.get(f"{INFERENCE_API_URL}/models")
         if response.status_code == 200:
             return response.json()
     except requests.exceptions.ConnectionError:
         return None
-    return None
+    return {} # Devolver dict vacío en caso de error
 
-@st.cache_data(ttl=10) # Cachear estado del clúster solo por 10 segundos para ver cambios
-def get_ray_cluster_status():
-    """Se conecta a Ray y devuelve el estado de los nodos."""
-    try:
-        # Se conecta al clúster de Ray si no está ya conectado
-        if not ray.is_initialized():
-            ray.init(address=RAY_ADDRESS, ignore_reinit_error=True)
-        
-        nodes = ray.nodes()
-        if not nodes:
-            return None, "No se encontraron nodos en el clúster de Ray."
+# --- Pestañas de la Interfaz ---
+tab_entrenamiento, tab_prediccion = st.tabs(["🚀 Nuevo Entrenamiento", "🤖 Realizar Predicción"])
 
-        node_data = []
-        for node in nodes:
-            # Extrae la información relevante de cada nodo
-            node_info = {
-                "Node ID": node.get("NodeID"),
-                "Estado": "Vivo" if node.get("Alive") else "Muerto",
-                "Dirección": f"{node.get('NodeManagerAddress')}:{node.get('NodeManagerPort')}",
-                "Hostname": node.get('NodeManagerHostname'),
-                "Recursos (CPU)": node.get("Resources", {}).get("CPU", 0),
-                # Convierte la memoria de bytes a Gigabytes para que sea más legible
-                "Memoria Total (GB)": round(node.get("Resources", {}).get("memory", 0) / (1024**3), 2)
-            }
-            node_data.append(node_info)
-        
-        # Convierte la lista de diccionarios en un DataFrame de Pandas
-        return pd.DataFrame(node_data), None
-    except Exception as e:
-        # Maneja errores de conexión o cualquier otro problema
-        return None, f"Error al conectar o consultar el clúster de Ray: {e}"
+with tab_entrenamiento:
+    st.header("Entrenar Nuevos Modelos con un Dataset")
+    st.markdown("Sube un archivo CSV, especifica un nombre para el dataset y el nombre de la columna objetivo.")
 
+    with st.form("training_form"):
+        dataset_name = st.text_input("Nombre del Dataset (e.g., 'carros_usados')", key="t_ds_name")
+        uploaded_file = st.file_uploader("Sube tu archivo CSV", type=["csv"], key="t_file")
+        target_column = st.text_input("Nombre de la Columna Objetivo", key="t_target")
+        submitted = st.form_submit_button("Iniciar Entrenamiento")
 
-# --- Diseño de la Interfaz ---
-
-# Obtiene los datos de los modelos disponibles al cargar la página
-models_data = get_available_models()
-
-# Crea las pestañas de la interfaz
-tab1, tab2, tab3 = st.tabs(["📈 Visualización del Entrenamiento", "🤖 Realizar Predicción", "📋 Estado del Sistema"])
-
-with tab1:
-    st.header("Métricas y Gráficas del Entrenamiento")
-    st.write("Aquí se muestran las gráficas generadas después del proceso de entrenamiento.")
-
-    if not os.path.exists(GRAPHS_DIR):
-        st.warning(f"El directorio de gráficas `{GRAPHS_DIR}` no fue encontrado. Ejecuta el entrenamiento primero.")
-    else:
-        graph_files = [f for f in os.listdir(GRAPHS_DIR) if f.endswith('.png')]
-        if not graph_files:
-            st.info("No se encontraron gráficas. El entrenamiento podría no haber generado ninguna imagen.")
-        else:
-            # Muestra cada gráfica encontrada
-            for graph_file in sorted(graph_files):
-                st.image(os.path.join(GRAPHS_DIR, graph_file), use_column_width=True)
-
-with tab2:
-    st.header("Probar un Modelo en Producción")
-
-    if not models_data:
-        st.error("No se pudo conectar a la API o no hay modelos disponibles. Asegúrate de que los servicios de entrenamiento y API estén en ejecución.")
-    else:
-        col1, col2 = st.columns(2)
-        with col1:
-            dataset = st.selectbox("Selecciona un Dataset:", list(models_data.keys()))
-            if dataset:
-                model_type = st.selectbox("Selecciona un Modelo:", list(models_data[dataset].keys()))
-
-        if dataset and model_type:
-            st.subheader(f"Características para {model_type} en {dataset}")
+        if submitted and dataset_name and uploaded_file and target_column:
+            files = {'file': (uploaded_file.name, uploaded_file.getvalue(), 'text/csv')}
+            data = {'target_column': target_column}
             
-            required_features = models_data[dataset][model_type]['features_required']
-            
-            # Formulario para introducir los datos de la predicción
-            with st.form("prediction_form"):
-                feature_inputs = {}
-                for feature in required_features:
-                    feature_inputs[feature] = st.number_input(f"Valor para `{feature}`:", value=0.0, format="%.4f")
-                
-                submitted = st.form_submit_button("Predecir")
+            with st.spinner(f"Enviando dataset '{dataset_name}' a la API de Gestión..."):
+                try:
+                    response = requests.post(f"{MANAGEMENT_API_URL}/datasets/{dataset_name}/train", files=files, data=data)
+                    if response.status_code == 200:
+                        st.success("¡Éxito! Trabajo de entrenamiento lanzado.")
+                        st.json(response.json())
+                        st.info("El entrenamiento se ejecuta en segundo plano. Refresca la lista de modelos en la pestaña de predicción en unos minutos.")
+                    else:
+                        st.error(f"Error de la API de Gestión ({response.status_code}):")
+                        st.json(response.json())
+                except requests.exceptions.ConnectionError:
+                    st.error(f"No se pudo conectar a la API de Gestión en {MANAGEMENT_API_URL}.")
 
-                if submitted:
-                    payload = {"features": feature_inputs}
-                    try:
-                        # Envía la petición a la API
-                        response = requests.post(f"{API_URL}/predict/{dataset}/{model_type}", json=payload)
-                        if response.status_code == 200:
-                            prediction = response.json()
-                            st.success(f"**Resultado de la Predicción:** `{prediction['prediction']}`")
-                        else:
-                            st.error(f"Error en la API: {response.status_code} - {response.text}")
-                    except requests.exceptions.ConnectionError as e:
-                        st.error(f"No se pudo conectar a la API. ¿Está funcionando? Error: {e}")
+with tab_prediccion:
+    st.header("Probar un Modelo Desplegado")
 
-with tab3:
-    st.header("Estado del Clúster de Ray")
-    
-    # Botón para forzar la actualización de los datos
-    if st.button("Actualizar Estado del Clúster"):
-        # Limpia la caché para obtener datos frescos al presionar el botón
+    if st.button("Refrescar lista de modelos"):
         st.cache_data.clear()
 
-    # Llama a la función para obtener el estado del clúster
-    df_nodes, error_message = get_ray_cluster_status()
+    models_data = get_available_models()
 
-    if error_message:
-        st.error(error_message)
-    elif df_nodes is not None and not df_nodes.empty:
-        st.success("Conexión con el clúster de Ray exitosa.")
-        st.write("A continuación se muestra el estado de los nodos que componen el clúster:")
-        
-        # Muestra la tabla con los datos de los nodos
-        st.dataframe(df_nodes, use_container_width=True)
-
-        # Muestra un resumen con métricas clave
-        total_cpus = df_nodes["Recursos (CPU)"].sum()
-        total_mem = df_nodes["Memoria Total (GB)"].sum()
-        st.metric(label="Nodos Vivos Totales", value=len(df_nodes))
-        st.metric(label="CPUs Totales en el Clúster", value=f"{total_cpus}")
-        st.metric(label="Memoria Total en el Clúster (GB)", value=f"{total_mem:.2f} GB")
+    if not models_data:
+        st.warning("No hay modelos disponibles o la API no responde. Entrena un modelo en la pestaña de 'Nuevo Entrenamiento'.")
     else:
-        st.warning("No se pudo obtener el estado del clúster o el clúster está vacío.")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            selected_dataset = st.selectbox("1. Selecciona un Dataset", list(models_data.keys()))
+            if selected_dataset:
+                selected_model = st.selectbox("2. Selecciona un Modelo", models_data[selected_dataset].get("available_models", []))
+        
+        with col2:
+            if selected_dataset and selected_model:
+                st.subheader(f"3. Ingresa las características para predecir")
+                # Aquí necesitaríamos obtener los feature_names, pero por simplicidad
+                # pedimos un JSON por ahora. Una GUI real tendría campos dinámicos.
+                st.info("Para esta demo, por favor ingresa un JSON con el diccionario de 'features'.")
+                features_json_str = st.text_area("JSON de Características", value='{"feature1": 0.0, "feature2": 0.0}', height=150)
+                
+                if st.button("Predecir"):
+                    try:
+                        features_dict = json.loads(features_json_str)
+                        request_body = {"features": features_dict}
+                        
+                        with st.spinner("Enviando petición de predicción..."):
+                            predict_response = requests.post(
+                                f"{INFERENCE_API_URL}/predict/{selected_dataset}/{selected_model}",
+                                json=request_body
+                            )
+                        
+                        if predict_response.status_code == 200:
+                            st.success("Predicción recibida:")
+                            st.json(predict_response.json())
+                        else:
+                            st.error(f"Error en la API de Inferencia ({predict_response.status_code}):")
+                            st.json(predict_response.json())
+
+                    except json.JSONDecodeError:
+                        st.error("El JSON de características no es válido.")
+                    except requests.exceptions.ConnectionError:
+                        st.error(f"No se pudo conectar a la API de Inferencia en {INFERENCE_API_URL}.")
