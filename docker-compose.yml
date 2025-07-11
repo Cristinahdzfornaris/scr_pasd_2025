@@ -1,14 +1,18 @@
+
+# docker-compose.yml
+
 services:
   ray-head:
     build: .
     container_name: ray-head
     ports:
-      - "8265:8265"  # Ray Dashboard
-      - "10001:10001" # Ray Client
+      - "8265:8265"
+      - "10001:10001"
+    # La clave es añadir la sección --resources
     command: |
       bash -c "
         ray start --head --num-cpus=1 --port=6379 --dashboard-host=0.0.0.0 --include-dashboard=true --ray-client-server-port=10001 --resources='{\"is_head_node\": 1}' && \
-        echo 'Nodo HEAD en marcha (con recurso is_head_node=1)...' && \
+        echo 'Nodo HEAD en marcha...' && \
         tail -f /dev/null
       "
     shm_size: 2gb
@@ -33,6 +37,7 @@ services:
       - ray-head
     command: |
       bash -c "
+        # Comando simplificado, ya no crea el actor
         ray start --address=ray-head:6379 --num-cpus=2 && \
         echo 'Worker 2 conectado al HEAD' && \
         tail -f /dev/null
@@ -47,6 +52,7 @@ services:
     ports:
       - "9000:9000"
     environment:
+      # Asegúrate de que la API se conecta como cliente al head node
       - RAY_ADDRESS=ray://ray-head:10001
     command: uvicorn management_api:app --host 0.0.0.0 --port 9000
     restart: on-failure
@@ -76,5 +82,12 @@ services:
       - MANAGEMENT_API_URL=http://management-api:9000
       - INFERENCE_API_URL=http://api-service:8000
       - RAY_DASHBOARD_URL=http://ray-head:8265
-    command: streamlit run gui.py --server.port=8501 --server.address=0.0.0.0
+      - RAY_ADDRESS=ray://ray-head:10001
+    command: |
+      bash -c "
+        echo 'GUI Service: Iniciando script de espera...'
+        python wait_for_services.py && \
+        echo 'GUI Service: Todas las APIs están listas, iniciando Streamlit...' && \
+        streamlit run gui.py --server.port=8501 --server.address=0.0.0.0
+      "
     restart: on-failure

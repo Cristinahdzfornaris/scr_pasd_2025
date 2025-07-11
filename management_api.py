@@ -1,181 +1,157 @@
 # management_api.py
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import pandas as pd
 import ray
 import os
+import train # Importar nuestro módulo de entrenamiento
 import traceback
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from contextlib import asynccontextmanager
-
-# Importar la lógica de entrenamiento y el actor desde el módulo train
-import train 
-
-# --- Lifespan Manager (La nueva forma de manejar startup/shutdown) ---
-
+from typing import List
+import json
+import time
+# --- Lifespan Manager (CORREGIDO Y ROBUSTO) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Gestiona los eventos de inicio y apagado de la aplicación FastAPI.
-    """
-    # --- CÓDIGO DE INICIO (STARTUP) ---
-    print(">>> LIFESPAN: Evento de inicio para Management API... <<<")
+    print(">>> LIFESPAN (Management API): Iniciando...")
     try:
-        # La dirección se toma de la variable de entorno configurada en docker-compose.yml
-        # o usa 'auto' si no está definida (para pruebas locales fuera de Docker)
+        # 1. Conectar a Ray
         ray_address = os.environ.get("RAY_ADDRESS", "auto")
-        
-        # Conectarse a Ray usando un namespace para aislar esta aplicación
         if not ray.is_initialized():
-            print(f">>> LIFESPAN: Intentando conectar a Ray en {ray_address} con namespace 'mi_plataforma'...")
-            ray.init(
-                address=ray_address, 
-                namespace="mi_plataforma", # Namespace para aislar actores y trabajos
-                ignore_reinit_error=True
-            )
+            ray.init(address=ray_address, namespace="mi_plataforma", ignore_reinit_error=True)
         
-        print(">>> LIFESPAN: Conectado a Ray. Asegurando que ModelRegistryActor exista...")
-        
-        # Crear/obtener el actor de registro. Es CRUCIAL para el sistema.
-        # Se fija al nodo head usando un recurso personalizado.
+        # 2. Solicitar la creación del actor con opciones de robustez
         train.ModelRegistryActor.options(
-            name="model_registry", 
-            get_if_exists=True, 
-            namespace="mi_plataforma", # Usar el mismo namespace
-            max_restarts=-1,         # Reiniciar indefinidamente si falla
-            lifetime="detached",     # El actor sobrevive al proceso que lo creó
-            resources={"is_head_node": 1}
+            name="model_registry",
+            get_if_exists=True,
+            namespace="mi_plataforma",
+            lifetime="detached",
+            max_restarts=-1,
+            
         ).remote()
+        print(">>> LIFESPAN (Management API): Solicitud de creación de ModelRegistryActor enviada.")
+
+        # 3. Bucle de verificación para confirmar que el actor está vivo
+        actor_ready = False
+        # Intentar por hasta 30 segundos
+        for i in range(30):
+            try:
+                # El intento de obtener el actor sirve como verificación
+                ray.get_actor("model_registry", namespace="mi_plataforma")
+                print(f">>> LIFESPAN (Management API): ¡ModelRegistryActor está listo y disponible! (Intento {i+1})")
+                actor_ready = True
+                break
+            except ValueError:
+                print(f">>> LIFESPAN (Management API): Esperando que ModelRegistryActor esté disponible... (Intento {i+1})")
+                time.sleep(1)
         
-        print(">>> LIFESPAN: Management API lista. ModelRegistryActor asegurado. <<<")
+        if not actor_ready:
+            # Si el actor no aparece después del tiempo de espera, se lanza un error y el servidor no arrancará
+            error_message = "!!! ERROR CRÍTICO: El ModelRegistryActor no estuvo disponible después del tiempo de espera. El servicio no puede iniciar."
+            print(error_message)
+            raise RuntimeError(error_message)
+
+
 
     except Exception as e:
-        print("!!! LIFESPAN: ERROR CRÍTICO DURANTE EL STARTUP !!!")
-        print(f"Error: {e}")
+        print(f"!!! LIFESPAN (Management API) ERROR DURANTE EL ARRANQUE: {e} !!!")
         traceback.print_exc()
-        # En un sistema real, podrías querer que la aplicación falle al iniciar si no puede conectar a Ray.
+        raise e # Relanzar la excepción para detener el inicio del servidor
     
-    yield # Aquí es donde la aplicación FastAPI se ejecuta y atiende peticiones
+    # La API sólo se ejecuta si todo lo anterior tuvo éxito
+    yield
     
-    # --- CÓDIGO DE APAGADO (SHUTDOWN) ---
-    print(">>> LIFESPAN: Evento de apagado para Management API...")
+    # Código de limpieza al apagar
     if ray.is_initialized():
         ray.shutdown()
-        print(">>> LIFESPAN: Desconexión de Ray completada.")
 
-# --- Inicialización de la Aplicación FastAPI ---
-app = FastAPI(
-    title="API de Gestión de Entrenamiento", 
-    description="API para subir datasets, iniciar trabajos de entrenamiento distribuidos y gestionar modelos.",
-    version="1.0.0",
-    lifespan=lifespan # Asignar el lifespan manager
-)
+# --- App FastAPI (asegúrate que use el lifespan) ---
+app = FastAPI(title="API de Gestión de Entrenamiento", version="1.2.0", lifespan=lifespan)
 
-# --- Endpoints de la API ---
+# En management_api.py
 
-@app.post("/datasets/{dataset_name}/train", summary="Subir Dataset y Entrenar")
-async def upload_and_train(
-    dataset_name: str,
-    target_column: str = Form(..., description="El nombre exacto de la columna en el CSV que se debe predecir."),
-    file: UploadFile = File(..., description="El archivo del dataset en formato CSV.")
+# ... (tus otros imports y la app FastAPI) ...
+
+@app.get("/debug/registry_state", summary="[DEBUG] Muestra el estado interno del registro de modelos")
+async def debug_get_registry_state():
+    """
+    Endpoint de depuración para ver el contenido completo del ModelRegistryActor.
+    ¡NO USAR EN PRODUCCIÓN!
+    """
+    try:
+        registry_actor = ray.get_actor("model_registry", namespace="mi_plataforma")
+        # Necesitamos un nuevo método en el actor que nos devuelva su estado interno
+        # para inspección.
+        internal_state = await registry_actor.get_internal_state.remote()
+        return internal_state
+    except ValueError:
+        raise HTTPException(status_code=503, detail="ModelRegistryActor no disponible.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al inspeccionar el actor: {e}")
+# --- Endpoints ---
+@app.post("/datasets/train_batch", summary="Subir y Entrenar un Lote de Datasets")
+async def upload_and_train_batch(
+    configs: str = Form(...),
+    models_to_train: List[str] = Form(...), 
+    files: List[UploadFile] = File(...)
 ):
-    """
-    Recibe un dataset CSV, lo pone en Ray y lanza un trabajo de entrenamiento distribuido.
-    El entrenamiento se ejecuta como una tarea Ray remota y asíncrona.
-    """
-    print(f"API: Recibiendo petición para entrenar el dataset '{dataset_name}' con columna objetivo '{target_column}'...")
+    print(f"API: Recibiendo petición de entrenamiento en lote para modelos: {models_to_train}")
     
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Formato de archivo inválido. Por favor, sube un archivo CSV.")
-
     try:
-        # Cargar el CSV en un DataFrame de Pandas
-        df = pd.read_csv(file.file)
-        print(f"API: CSV '{file.filename}' cargado, shape: {df.shape}")
+        dataset_configs = json.loads(configs)
+        uploaded_files_map = {file.filename: file for file in files}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"No se pudo parsear el archivo CSV: {e}")
+        raise HTTPException(status_code=400, detail=f"Error procesando la entrada: {e}")
 
-    if target_column not in df.columns:
-        raise HTTPException(status_code=400, detail=f"La columna objetivo '{target_column}' no se encuentra en las columnas del dataset: {df.columns.tolist()}")
+    launched_jobs_info = []
+    errors = []
 
-    try:
-        print(f"API: Lanzando el trabajo de entrenamiento para '{dataset_name}' en el clúster de Ray...")
+    for config in dataset_configs:
+        dataset_name = config.get("dataset_name")
+        target_column = config.get("target_column")
+        filename = config.get("filename")
+
+        if not all([dataset_name, target_column, filename]) or filename not in uploaded_files_map:
+            errors.append({"dataset_config": config, "error": "Configuración incompleta o archivo no encontrado."})
+            continue
+
+        file = uploaded_files_map[filename]
         
-        # Lanzar el trabajo de entrenamiento completo como una tarea Ray remota
-        # Esta llamada devuelve inmediatamente una ObjectRef (o ClientObjectRef)
-        job_ref = train.run_complete_training_job.remote(dataset_name, df, target_column)
-        
-        print(f"API: Trabajo de Ray lanzado exitosamente. Ref: {job_ref}")
+        try:
+            df = pd.read_csv(file.file)
+            await file.close() # Importante cerrar el archivo subido
+            
+            if target_column not in df.columns:
+                errors.append({"dataset_config": config, "error": f"Columna objetivo '{target_column}' no encontrada."})
+                continue
 
-    except Exception as e:
-        print(f"API: ERROR al lanzar el trabajo de entrenamiento en Ray: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"No se pudo lanzar el trabajo de entrenamiento en Ray: {e}")
+            # --- CORRECCIÓN AQUÍ ---
+            # Llamar a la función de entrenamiento directamente.
+            # Esta llamada es bloqueante pero rápida, ya que solo lanza tareas a Ray.
+            result_message = train.run_complete_training_job(
+                dataset_name, df, target_column, models_to_train
+            )
+            launched_jobs_info.append({"dataset_name": dataset_name, "status": result_message})
+
+        except Exception as e:
+            error_msg = f"Error al lanzar el job para '{dataset_name}': {e}"
+            errors.append({"dataset_config": config, "error": error_msg})
+            traceback.print_exc()
 
     return {
-        "message": "Trabajo de entrenamiento lanzado exitosamente.",
-        "dataset_name": dataset_name,
-        "job_info": "El entrenamiento se ejecuta en segundo plano. Monitorea el progreso en el Ray Dashboard o los logs.",
-        "job_ref_str": str(job_ref)
+        "message": "Procesamiento de lote completado.",
+        "launched_jobs": launched_jobs_info,
+        "errors": errors
     }
 
+# Endpoint para eliminar, se mantiene igual
 @app.delete("/models/{dataset_name}", summary="Eliminar Modelos de un Dataset")
 async def delete_models(dataset_name: str):
-    """
-    Le dice al ModelRegistryActor que elimine del registro todos los modelos 
-    asociados a un dataset específico.
-    """
-    print(f"API: Recibiendo petición para eliminar modelos del dataset '{dataset_name}'...")
     try:
-        # Obtener una referencia al actor que ya debería existir
         registry_actor = ray.get_actor("model_registry", namespace="mi_plataforma")
-        
-        # Llamar al método del actor de forma remota
         success = await registry_actor.delete_dataset_models.remote(dataset_name)
-        
         if success:
-            return {"message": f"Modelos para el dataset '{dataset_name}' eliminados del registro."}
+            return {"message": f"Modelos para '{dataset_name}' eliminados del registro."}
         else:
-            raise HTTPException(status_code=404, detail=f"No se encontraron modelos para el dataset '{dataset_name}' en el registro.")
-            
+            raise HTTPException(status_code=404, detail=f"No se encontraron modelos para el dataset '{dataset_name}'.")
     except ValueError:
-        # Este error ocurre si ray.get_actor no encuentra el actor
-        raise HTTPException(status_code=503, detail="Servicio no disponible: ModelRegistryActor no encontrado en el clúster Ray.")
-    except Exception as e:
-        print(f"API: ERROR al eliminar modelos: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {e}")
-
-
-
-@app.get("/debug/actor_status", tags=["Debug"])
-async def get_actor_status():
-    """
-    Endpoint de depuración para verificar el estado del ModelRegistryActor 
-    desde la perspectiva de la API de Gestión.
-    """
-    try:
-        # Intenta obtener el actor usando el mismo nombre y namespace
-        actor = ray.get_actor("model_registry", namespace="mi_plataforma")
-        
-        # Llama a un método del actor para asegurarte de que responde
-        model_list = await actor.list_models_details.remote()
-        
-        return {
-            "actor_found": True,
-            "actor_name": "model_registry",
-            "actor_status": "ALIVE_AND_RESPONDING",
-            "registered_models": model_list
-        }
-    except ValueError:
-        # Esto ocurre si get_actor no encuentra el actor
-        return {
-            "actor_found": False,
-            "actor_name": "model_registry",
-            "actor_status": "NOT_FOUND",
-            "detail": "ray.get_actor('model_registry') lanzó ValueError."
-        }
-    except Exception as e:
-        return {
-            "actor_found": "unknown",
-            "actor_status": "ERROR",
-            "detail": f"Ocurrió un error inesperado: {str(e)}"
-        }
+        raise HTTPException(status_code=503, detail="ModelRegistryActor no disponible.")
