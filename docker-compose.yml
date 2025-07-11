@@ -20,7 +20,7 @@ services:
       - ray-head
     command: |
       bash -c "
-        ray start --address=ray-head:6379 --num-cpus=1 && \
+        ray start --address=ray-head:6379 --num-cpus=2 && \
         echo 'Worker 1 conectado al HEAD' && \
         tail -f /dev/null
       "
@@ -33,7 +33,7 @@ services:
       - ray-head
     command: |
       bash -c "
-        ray start --address=ray-head:6379 --num-cpus=1 && \
+        ray start --address=ray-head:6379 --num-cpus=2 && \
         echo 'Worker 2 conectado al HEAD' && \
         tail -f /dev/null
       "
@@ -72,8 +72,9 @@ services:
     ports:
       - "8501:8501"
     environment:
-      # Las URLs para que la GUI sepa a dónde apuntar
+      # URLs para que la GUI sepa a dónde apuntar
       - MANAGEMENT_API_URL=http://management-api:9000
       - INFERENCE_API_URL=http://api-service:8000
+      - RAY_DASHBOARD_URL=http://ray-head:8265
     command: streamlit run gui.py --server.port=8501 --server.address=0.0.0.0
     restart: on-failure
