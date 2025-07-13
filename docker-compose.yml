@@ -1,4 +1,3 @@
-
 # docker-compose.yml
 
 services:
@@ -8,14 +7,13 @@ services:
     ports:
       - "8265:8265"
       - "10001:10001"
-    # La clave es añadir la sección --resources
     command: |
       bash -c "
         ray start --head --num-cpus=1 --port=6379 --dashboard-host=0.0.0.0 --include-dashboard=true --ray-client-server-port=10001 --resources='{\"is_head_node\": 1}' && \
         echo 'Nodo HEAD en marcha...' && \
         tail -f /dev/null
       "
-    shm_size: 2gb
+    shm_size: 2.5gb # Aumentado para quitar advertencias
 
   ray-worker-1:
     build: .
@@ -28,7 +26,7 @@ services:
         echo 'Worker 1 conectado al HEAD' && \
         tail -f /dev/null
       "
-    shm_size: 2gb
+    shm_size: 2.5gb
 
   ray-worker-2:
     build: .
@@ -37,12 +35,11 @@ services:
       - ray-head
     command: |
       bash -c "
-        # Comando simplificado, ya no crea el actor
         ray start --address=ray-head:6379 --num-cpus=2 && \
         echo 'Worker 2 conectado al HEAD' && \
         tail -f /dev/null
       "
-    shm_size: 2gb
+    shm_size: 2.5gb
   
   management-api:
     build: .
@@ -52,42 +49,59 @@ services:
     ports:
       - "9000:9000"
     environment:
-      # Asegúrate de que la API se conecta como cliente al head node
       - RAY_ADDRESS=ray://ray-head:10001
     command: uvicorn management_api:app --host 0.0.0.0 --port 9000
     restart: on-failure
+    # --- Healthcheck para que otros servicios puedan esperar por él ---
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   api-service:
     build: .
     container_name: api-service
     depends_on:
-      - ray-head
+      # --- Dependencia condicional: espera a que management-api esté saludable ---
+      management-api:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      - RAY_ADDRESS=ray://ray-head:10001
+      # Ya no necesita RAY_ADDRESS, pero sí la URL de la API de gestión
+      - MANAGEMENT_API_URL=http://management-api:9000
     command: uvicorn api:app --host 0.0.0.0 --port 8000
     restart: on-failure
+    # --- Healthcheck para que la GUI pueda esperar por él ---
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   gui-service:
     build: .
     container_name: gui-service
     depends_on:
-      - api-service
-      - management-api
+      # --- Dependencia condicional: espera a que la API de inferencia esté lista ---
+      api-service:
+        condition: service_healthy
     ports:
       - "8501:8501"
     environment:
-      # URLs para que la GUI sepa a dónde apuntar
       - MANAGEMENT_API_URL=http://management-api:9000
       - INFERENCE_API_URL=http://api-service:8000
       - RAY_DASHBOARD_URL=http://ray-head:8265
+      # Ya no es estrictamente necesario que la GUI se conecte a Ray,
+      # pero lo mantenemos para el dashboard de monitoreo que creaste.
       - RAY_ADDRESS=ray://ray-head:10001
     command: |
+     
       bash -c "
-        echo 'GUI Service: Iniciando script de espera...'
-        python wait_for_services.py && \
-        echo 'GUI Service: Todas las APIs están listas, iniciando Streamlit...' && \
+        echo 'GUI Service: Dependencias saludables, iniciando Streamlit...' && \
         streamlit run gui.py --server.port=8501 --server.address=0.0.0.0
       "
     restart: on-failure
