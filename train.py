@@ -19,33 +19,30 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
-# --- Actor de Registro de Modelos (SIMPLIFICADO) ---
+# --- Actor de Registro de Modelos (Guarda artefactos en memoria) ---
 @ray.remote
 class ModelRegistryActor:
     def __init__(self):
+        # Almacena el diccionario completo de artefactos serializados (bytes)
         self.registered_models = {}
-        print(f"[{self.__class__.__name__}] Actor de Registro de Modelos inicializado.")
-
+        print(f"[{self.__class__.__name__}] Actor de Registro de Modelos (en memoria) inicializado.")
+    
     def register_model(self, dataset_name, model_type, result_dict):
         """
-        Registra el diccionario de artefactos serializados directamente.
+        Registra el diccionario de artefactos serializados directamente en memoria.
         """
         if dataset_name not in self.registered_models:
             self.registered_models[dataset_name] = {}
-        
-        # Almacena el diccionario directamente, que contiene los bytes de los artefactos
         self.registered_models[dataset_name][model_type] = result_dict
-        
-        print(f"[{self.__class__.__name__}] Modelo registrado: {dataset_name}/{model_type}")
+        print(f"Registro en memoria para {dataset_name}/{model_type} completado.")
         return True
 
-    def get_model_artifacts_ref(self, dataset_name, model_type):
+    def get_model_artifacts(self, dataset_name, model_type):
         """
-        Devuelve el diccionario de artefactos serializados.
-        El nombre del método se mantiene por consistencia, aunque ya no es una 'ref'.
+        Devuelve el diccionario de artefactos serializados desde la memoria.
         """
         return self.registered_models.get(dataset_name, {}).get(model_type)
-    
+
     def list_models_details(self):
         details = {}
         for dataset, models in self.registered_models.items():
@@ -57,10 +54,11 @@ class ModelRegistryActor:
     def delete_dataset_models(self, dataset_name):
         if dataset_name in self.registered_models:
             del self.registered_models[dataset_name]
+            # Nota: Esto no borra el archivo del disco. Se podría añadir esa lógica si se desea.
             return True
         return False
 
-# --- Tarea de Entrenamiento Remota (se mantiene igual) ---
+# --- Tarea de Entrenamiento Remota (Sin Cambios) ---
 @ray.remote(num_cpus=1)
 def train_and_serialize_model(
     data_df_input,
@@ -139,7 +137,7 @@ def train_and_serialize_model(
         traceback.print_exc()
         return None
 
-# --- Función Orquestadora Principal (MODIFICADA) ---
+# --- Función Orquestadora Principal (Con Persistencia) ---
 def run_complete_training_job(dataset_name: str, df: pd.DataFrame, target_column: str, models_to_train: List[str]):
     print(f"ORQUESTADOR: Iniciando trabajo para '{dataset_name}'. Modelos: {models_to_train}")
     
@@ -176,20 +174,30 @@ def run_complete_training_job(dataset_name: str, df: pd.DataFrame, target_column
         )
         task_refs.append((model_type, task_ref))
 
-    # --- CAMBIO IMPORTANTE: Esperar resultados y registrar ---
     print(f"ORQUESTADOR: Esperando la finalización de {len(task_refs)} tareas...")
+    
+    base_model_dir = "/app/persistent_models"
+    os.makedirs(base_model_dir, exist_ok=True)
+    
     for model_type, ref in task_refs:
         try:
-            # ray.get espera a que la tarea termine y devuelve su resultado
             result_dictionary = ray.get(ref)
             if result_dictionary:
-                # Registramos el diccionario completo en el actor
+                # 1. Registrar en el actor en memoria para acceso rápido
                 registry_actor.register_model.remote(dataset_name, model_type, result_dictionary)
+                
+                # 2. Guardar en disco para persistencia a largo plazo
+                model_file_path = os.path.join(base_model_dir, f"{dataset_name}_{model_type}.pkl")
+                with open(model_file_path, "wb") as f:
+                    pickle.dump(result_dictionary, f)
+                
+                print(f"ORQUESTADOR: Modelo guardado en disco en: {model_file_path}")
             else:
                 print(f"ORQUESTADOR: Tarea para {model_type} en {dataset_name} falló (devolvió None).")
         except Exception as e:
             print(f"ORQUESTADOR: Excepción al obtener resultado para {model_type}: {e}")
+            traceback.print_exc()
 
-    final_message = f"Trabajo para '{dataset_name}' completado y modelos registrados."
+    final_message = f"Trabajo para '{dataset_name}' completado."
     print(f"ORQUESTADOR: {final_message}")
     return final_message
