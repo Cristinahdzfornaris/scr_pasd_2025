@@ -29,10 +29,12 @@ class ModelRegistryActor:
     
     def register_model(self, dataset_name, model_type, result_dict):
         """
-        Registra el diccionario de artefactos serializados directamente en memoria.
+        Registra un modelo bajo un dataset específico.
         """
+
         if dataset_name not in self.registered_models:
             self.registered_models[dataset_name] = {}
+        
         self.registered_models[dataset_name][model_type] = result_dict
         print(f"Registro en memoria para {dataset_name}/{model_type} completado.")
         return True

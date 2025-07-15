@@ -1,9 +1,10 @@
-# docker-compose.yml
+# docker-compose.yml (VERSIÓN FINAL - RESILIENTE)
 
 services:
+  # Los servicios de Ray no cambian. ray-head sigue siendo el SPOF principal por diseño.
   ray-head:
     build: .
-    container_name: ray-head
+    # Ya no usamos container_name para facilitar el escalado, aunque en head no es estrictamente necesario.
     ports:
       - "8265:8265"
       - "10001:10001"
@@ -13,95 +14,65 @@ services:
         echo 'Nodo HEAD en marcha...' && \
         tail -f /dev/null
       "
-    shm_size: 2.5gb # Aumentado para quitar advertencias
-
-  ray-worker-1:
-    build: .
-    container_name: ray-worker-1
-    depends_on:
-      - ray-head
-    command: |
-      bash -c "
-        ray start --address=ray-head:6379 --num-cpus=2 && \
-        echo 'Worker 1 conectado al HEAD' && \
-        tail -f /dev/null
-      "
     shm_size: 2.5gb
 
-  ray-worker-2:
+  ray-worker: # Unificamos los workers para facilitar el escalado
     build: .
-    container_name: ray-worker-2
     depends_on:
       - ray-head
+    deploy:
+      replicas: 2 # Podemos escalar los workers de Ray fácilmente
     command: |
       bash -c "
         ray start --address=ray-head:6379 --num-cpus=2 && \
-        echo 'Worker 2 conectado al HEAD' && \
+        echo 'Worker conectado al HEAD' && \
         tail -f /dev/null
       "
     shm_size: 2.5gb
   
+  # SOLUCIÓN #1: Replicación del servicio crítico
   management-api:
     build: .
-    container_name: management-api
-    depends_on:
-      - ray-head
-    ports:
-      - "9000:9000"
+    # Ya no se usa container_name para permitir la replicación.
+    # Ya no se exponen puertos, la comunicación es interna a través de la GUI.
+    deploy:
+      replicas: 3 # Creamos un grupo de 3 réplicas para alta disponibilidad.
     environment:
       - RAY_ADDRESS=ray://ray-head:10001
+      - SERVICE_NAME=management-api # Para que el cliente resiliente sepa a quién buscar
     command: uvicorn management_api:app --host 0.0.0.0 --port 9000
-    restart: on-failure
-    # --- Healthcheck para que otros servicios puedan esperar por él ---
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
+    # Quitamos el healthcheck porque la GUI ahora es responsable de manejar los fallos.
+  
+  # Hacemos lo mismo para el servicio de inferencia para consistencia
   api-service:
     build: .
-    container_name: api-service
-    depends_on:
-      # --- Dependencia condicional: espera a que management-api esté saludable ---
-      management-api:
-        condition: service_healthy
-    ports:
-      - "8000:8000"
+    deploy:
+      replicas: 3 # También replicamos el servicio de inferencia.
+    # ports:
+      # Exponemos este puerto para que sea más fácil de probar externamente (ej. con curl)
+      # Pero idealmente, la GUI también usaría un cliente resiliente para este.
+      # - "8000:8000"
     environment:
-      # Ya no necesita RAY_ADDRESS, pero sí la URL de la API de gestión
-      - MANAGEMENT_API_URL=http://management-api:9000
+      # El api-service también se beneficia del balanceo de carga interno de Docker
+      # al hablar con las réplicas de management-api.
+      - MANAGEMENT_API_URL=http://management-api:9000 
     command: uvicorn api:app --host 0.0.0.0 --port 8000
-    restart: on-failure
-    # --- Healthcheck para que la GUI pueda esperar por él ---
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
 
+  # SOLUCIÓN #2: La GUI ahora es el cliente inteligente
   gui-service:
     build: .
-    container_name: gui-service
+    container_name: gui-service # La GUI es única, así que puede tener nombre.
     depends_on:
-      # --- Dependencia condicional: espera a que la API de inferencia esté lista ---
-      api-service:
-        condition: service_healthy
+      - management-api
+      - api-service
     ports:
       - "8501:8501"
     environment:
-      - MANAGEMENT_API_URL=http://management-api:9000
-      - INFERENCE_API_URL=http://api-service:8000
+      # Pasamos la información necesaria para que el ResilientClient haga su trabajo.
+      - MANAGEMENT_API_SERVICE_NAME=management-api
+      - MANAGEMENT_API_PORT=9000
+      # La URL de inferencia puede apuntar al nombre del servicio; Docker hará un balanceo de carga simple (round-robin).
+      - INFERENCE_API_URL=http://api-service:8000 
       - RAY_DASHBOARD_URL=http://ray-head:8265
-      # Ya no es estrictamente necesario que la GUI se conecte a Ray,
-      # pero lo mantenemos para el dashboard de monitoreo que creaste.
       - RAY_ADDRESS=ray://ray-head:10001
-    command: |
-     
-      bash -c "
-        echo 'GUI Service: Dependencias saludables, iniciando Streamlit...' && \
-        streamlit run gui.py --server.port=8501 --server.address=0.0.0.0
-      "
-    restart: on-failure
+    command: streamlit run gui.py --server.port=8501 --server.address=0.0.0.0

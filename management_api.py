@@ -190,3 +190,34 @@ async def registry_get_artifact(dataset_name: str, model_type: str, artifact_nam
         raise HTTPException(status_code=503, detail="ModelRegistryActor no disponible.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno obteniendo el artefacto: {e}")
+
+# management_api.py
+
+# ... (todos tus otros imports y endpoints se mantienen igual) ...
+
+
+# === NUEVO ENDPOINT PARA ANÁLISIS DE ARCHIVOS ===
+@app.post("/datasets/analyze", summary="Subir y Analizar un CSV para obtener sus columnas")
+async def analyze_dataset(file: UploadFile = File(...)):
+    """
+    Recibe un archivo CSV, lo lee con Pandas y devuelve información básica
+    como los nombres de las columnas y una previsualización de los datos.
+    """
+    try:
+        # Lee el contenido del archivo en un DataFrame
+        df = pd.read_csv(file.file)
+        
+        # Obtiene los nombres de las columnas
+        columns = df.columns.tolist()
+        
+        # Obtiene una previsualización de las primeras 5 filas en formato JSON
+        preview = df.head().to_dict(orient="records")
+        
+        return {
+            "filename": file.filename,
+            "columns": columns,
+            "preview": preview,
+            "rows": len(df)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo procesar el archivo. Error: {e}")

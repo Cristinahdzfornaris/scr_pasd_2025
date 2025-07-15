@@ -51,10 +51,15 @@ def get_actor_status(actor_name="model_registry", namespace="mi_plataforma"):
         return {"Estado": "❌ No Encontrado / Muerto", "Vivo": "❌"}
 
 # La función get_inference_stats se mantiene igual
-def get_inference_stats(metrics_url: str):
+def get_inference_stats(client):
+    """
+    Obtiene las estadísticas de inferencia desde el endpoint /metrics
+    utilizando un ResilientClient para alta disponibilidad.
+    """
     try:
-        response = requests.get(metrics_url, timeout=5)
-        response.raise_for_status()
+        # En lugar de requests.get(metrics_url), usamos nuestro cliente inteligente.
+        # El endpoint para las métricas de Prometheus es siempre '/metrics'.
+        response = client.make_request("GET", "/metrics", timeout=5)
         
         stats = {
             "total_requests": 0,
@@ -63,14 +68,20 @@ def get_inference_stats(metrics_url: str):
         }
         
         model_data = {}
+        # El resto de la lógica para parsear las métricas es la misma.
         for family in text_string_to_metric_families(response.text):
-            if family.name == "inference_latency_seconds":
+            if family.name == "inference_latency_seconds_count":
                 for sample in family.samples:
                     model_key = tuple(sorted(sample.labels.items()))
                     if model_key not in model_data:
                         model_data[model_key] = {"count": 0, "sum": 0.0}
-                    if sample.name.endswith("_count"): model_data[model_key]["count"] += sample.value
-                    if sample.name.endswith("_sum"): model_data[model_key]["sum"] += sample.value
+                    model_data[model_key]["count"] += sample.value
+            elif family.name == "inference_latency_seconds_sum":
+                 for sample in family.samples:
+                    model_key = tuple(sorted(sample.labels.items()))
+                    if model_key not in model_data:
+                        model_data[model_key] = {"count": 0, "sum": 0.0}
+                    model_data[model_key]["sum"] += sample.value
 
         total_latency_sum = sum(data["sum"] for data in model_data.values())
         stats["total_requests"] = int(sum(data["count"] for data in model_data.values()))
@@ -85,5 +96,65 @@ def get_inference_stats(metrics_url: str):
         if stats["total_requests"] > 0:
             stats["average_latency_ms"] = (total_latency_sum / stats["total_requests"]) * 1000
         return stats
-    except requests.exceptions.RequestException as e:
-        return {"error": f"No se pudo conectar a la API de métricas: {e}"}
+    except Exception as e:
+        return {"error": f"No se pudo obtener las métricas de inferencia: {e}"}
+
+def get_aggregated_inference_stats(client):
+    """
+    Obtiene métricas de TODAS las réplicas de un servicio y las agrega.
+    """
+    # Usamos la lista de servidores del cliente resiliente
+    all_servers = client.servers
+    if not all_servers:
+        return {"error": "No se encontraron servidores para el servicio de inferencia."}
+
+    aggregated_stats = {
+        "total_requests": 0,
+        "total_latency_sum": 0.0,
+        "details_by_model": {} # Usamos un dict para agregar por modelo
+    }
+    
+    # Iteramos sobre cada servidor descubierto
+    for server_url in all_servers:
+        try:
+            # Hacemos una petición directa a cada réplica
+            response = requests.get(f"{server_url}/metrics", timeout=2)
+            response.raise_for_status()
+            
+            # Parseamos la respuesta de esta réplica específica
+            for family in text_string_to_metric_families(response.text):
+                if family.name == "inference_latency_seconds_count":
+                    for sample in family.samples:
+                        # Creamos una clave única para cada modelo/dataset
+                        model_key = f"{sample.labels.get('dataset', 'N/A')}/{sample.labels.get('model_type', 'N/A')}"
+                        if model_key not in aggregated_stats["details_by_model"]:
+                            aggregated_stats["details_by_model"][model_key] = {"count": 0, "sum": 0.0}
+                        aggregated_stats["details_by_model"][model_key]["count"] += sample.value
+                elif family.name == "inference_latency_seconds_sum":
+                    for sample in family.samples:
+                        model_key = f"{sample.labels.get('dataset', 'N/A')}/{sample.labels.get('model_type', 'N/A')}"
+                        if model_key not in aggregated_stats["details_by_model"]:
+                            aggregated_stats["details_by_model"][model_key] = {"count": 0, "sum": 0.0}
+                        aggregated_stats["details_by_model"][model_key]["sum"] += sample.value
+
+        except requests.exceptions.RequestException as e:
+            print(f"No se pudo obtener métricas de la réplica {server_url}: {e}")
+            # Continuamos con la siguiente réplica si una falla
+
+    # Ahora calculamos los totales a partir de los datos agregados
+    total_reqs = sum(data["count"] for data in aggregated_stats["details_by_model"].values())
+    total_latency = sum(data["sum"] for data in aggregated_stats["details_by_model"].values())
+    
+    final_stats = {
+        "total_requests": int(total_reqs),
+        "average_latency_ms": (total_latency / total_reqs) * 1000 if total_reqs > 0 else 0,
+        "details_by_model": [
+            {
+                "Modelo": model_key,
+                "Peticiones": int(data["count"]),
+                "Latencia Media (ms)": (data["sum"] / data["count"]) * 1000 if data["count"] > 0 else 0
+            } for model_key, data in aggregated_stats["details_by_model"].items()
+        ]
+    }
+    
+    return final_stats
